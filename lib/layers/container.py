@@ -24,3 +24,14 @@ class SequentialFlow(nn.Module):
             for i in inds:
                 x, logpx = self.chain[i](x, logpx, reverse=reverse)
             return x, logpx
+
+    def forward_pathwise(self, x, logpx, dlogqzdz, reverse=False, inds=None):
+        if inds is None:
+            if reverse:
+                inds = range(len(self.chain) - 1, -1, -1)
+            else:
+                inds = range(len(self.chain))
+
+        for i in inds:
+            x, logpx, dlogqzdz = self.chain[i].forward_pathwise(x, logpx, dlogqzdz, reverse=reverse)
+        return x, logpx, dlogqzdz

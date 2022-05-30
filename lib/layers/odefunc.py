@@ -11,7 +11,7 @@ __all__ = ["ODEnet", "AutoencoderDiffEqNet", "ODEfunc", "AutoencoderODEfunc"]
 
 
 def divergence_bf(dx, y, **unused_kwargs):
-    sum_diag = 0.
+    sum_diag = 0.0
     for i in range(y.shape[1]):
         sum_diag += torch.autograd.grad(dx[:, i].sum(), y, create_graph=True)[0].contiguous()[:, i].contiguous()
     return sum_diag.contiguous()
@@ -38,8 +38,9 @@ def _get_minibatch_jacobian(y, x):
     # Compute Jacobian row by row.
     jac = []
     for j in range(y.shape[1]):
-        dy_j_dx = torch.autograd.grad(y[:, j], x, torch.ones_like(y[:, j]), retain_graph=True,
-                                      create_graph=True)[0].view(x.shape[0], -1)
+        dy_j_dx = torch.autograd.grad(y[:, j], x, torch.ones_like(y[:, j]), retain_graph=True, create_graph=True)[
+            0
+        ].view(x.shape[0], -1)
         jac.append(torch.unsqueeze(dy_j_dx, 1))
     jac = torch.cat(jac, 1)
     return jac
@@ -61,7 +62,6 @@ def sample_gaussian_like(y):
 
 
 class Swish(nn.Module):
-
     def __init__(self):
         super(Swish, self).__init__()
         self.beta = nn.Parameter(torch.tensor(1.0))
@@ -71,7 +71,6 @@ class Swish(nn.Module):
 
 
 class Lambda(nn.Module):
-
     def __init__(self, f):
         super(Lambda, self).__init__()
         self.f = f
@@ -86,7 +85,7 @@ NONLINEARITIES = {
     "softplus": nn.Softplus(),
     "elu": nn.ELU(),
     "swish": Swish(),
-    "square": Lambda(lambda x: x**2),
+    "square": Lambda(lambda x: x ** 2),
     "identity": Lambda(lambda x: x),
 }
 
@@ -141,7 +140,7 @@ class ODEnet(nn.Module):
             elif stride == -2:
                 layer_kwargs = {"ksize": 4, "stride": 2, "padding": 1, "transpose": True}
             else:
-                raise ValueError('Unsupported stride: {}'.format(stride))
+                raise ValueError("Unsupported stride: {}".format(stride))
 
             layer = base_layer(hidden_shape[0], dim_out, **layer_kwargs)
             layers.append(layer)
@@ -224,7 +223,7 @@ class AutoencoderDiffEqNet(nn.Module):
             elif stride == -2:
                 layer_kwargs = {"ksize": 4, "stride": 2, "padding": 1, "transpose": True}
             else:
-                raise ValueError('Unsupported stride: {}'.format(stride))
+                raise ValueError("Unsupported stride: {}".format(stride))
 
             layers.append(base_layer(hidden_shape[0], dim_out, **layer_kwargs))
 
@@ -253,7 +252,6 @@ class AutoencoderDiffEqNet(nn.Module):
 
 
 class ODEfunc(nn.Module):
-
     def __init__(self, diffeq, divergence_fn="approximate", residual=False, rademacher=False):
         super(ODEfunc, self).__init__()
         assert divergence_fn in ("brute_force", "approximate")
@@ -268,7 +266,7 @@ class ODEfunc(nn.Module):
         elif divergence_fn == "approximate":
             self.divergence_fn = divergence_approx
 
-        self.register_buffer("_num_evals", torch.tensor(0.))
+        self.register_buffer("_num_evals", torch.tensor(0.0))
 
     def before_odeint(self, e=None):
         self._e = e
@@ -300,6 +298,9 @@ class ODEfunc(nn.Module):
             t.requires_grad_(True)
             for s_ in states[2:]:
                 s_.requires_grad_(True)
+
+            # I just skip the extra state that was used for dlogqdzT
+            # This is the case for the backward call
             dy = self.diffeq(t, y, *states[2:])
             # Hack for 2D data to use brute force divergence computation.
             if not self.training and dy.view(dy.shape[0], -1).shape[1] == 2:
@@ -308,13 +309,13 @@ class ODEfunc(nn.Module):
                 divergence = self.divergence_fn(dy, y, e=self._e).view(batchsize, 1)
         if self.residual:
             dy = dy - y
-            divergence -= torch.ones_like(divergence) * torch.tensor(np.prod(y.shape[1:]), dtype=torch.float32
-                                                                     ).to(divergence)
+            divergence -= torch.ones_like(divergence) * torch.tensor(np.prod(y.shape[1:]), dtype=torch.float32).to(
+                divergence
+            )
         return tuple([dy, -divergence] + [torch.zeros_like(s_).requires_grad_(True) for s_ in states[2:]])
 
 
 class AutoencoderODEfunc(nn.Module):
-
     def __init__(self, autoencoder_diffeq, divergence_fn="approximate", residual=False, rademacher=False):
         assert divergence_fn in ("approximate"), "Only approximate divergence supported at the moment. (TODO)"
         assert isinstance(autoencoder_diffeq, AutoencoderDiffEqNet)
@@ -323,7 +324,7 @@ class AutoencoderODEfunc(nn.Module):
         self.autoencoder_diffeq = autoencoder_diffeq
         self.rademacher = rademacher
 
-        self.register_buffer("_num_evals", torch.tensor(0.))
+        self.register_buffer("_num_evals", torch.tensor(0.0))
 
     def before_odeint(self, e=None):
         self._e = e
@@ -357,7 +358,8 @@ class AutoencoderODEfunc(nn.Module):
 
         if self.residual:
             dy = dy - y
-            divergence -= torch.ones_like(divergence) * torch.tensor(np.prod(y.shape[1:]), dtype=torch.float32
-                                                                     ).to(divergence)
+            divergence -= torch.ones_like(divergence) * torch.tensor(np.prod(y.shape[1:]), dtype=torch.float32).to(
+                divergence
+            )
 
         return dy, -divergence

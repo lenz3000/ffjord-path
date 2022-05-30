@@ -10,7 +10,7 @@ import numpy as np
 from train_misc import count_nfe, override_divergence_fn
 
 
-def train(epoch, train_loader, model, opt, args, logger):
+def train(epoch, train_loader, model, opt, args, logger, writer=None):
 
     model.train()
     train_loss = np.zeros(len(train_loader))
@@ -19,8 +19,8 @@ def train(epoch, train_loader, model, opt, args, logger):
     num_data = 0
 
     # set warmup coefficient
-    beta = min([(epoch * 1.) / max([args.warmup, 1.]), args.max_beta])
-    logger.info('beta = {:5.4f}'.format(beta))
+    beta = min([(epoch * 1.0) / max([args.warmup, 1.0]), args.max_beta])
+    logger.info("beta = {:5.4f}".format(beta))
     end = time.time()
     for batch_idx, (data, _) in enumerate(train_loader):
         if args.cuda:
@@ -34,14 +34,14 @@ def train(epoch, train_loader, model, opt, args, logger):
         opt.zero_grad()
         x_mean, z_mu, z_var, ldj, z0, zk = model(data)
 
-        if 'cnf' in args.flow:
+        if "cnf" in args.flow:
             f_nfe = count_nfe(model)
 
         loss, rec, kl, bpd = calculate_loss(x_mean, data, z_mu, z_var, z0, zk, ldj, args, beta=beta)
 
         loss.backward()
 
-        if 'cnf' in args.flow:
+        if "cnf" in args.flow:
             t_nfe = count_nfe(model)
             b_nfe = t_nfe - f_nfe
 
@@ -59,47 +59,58 @@ def train(epoch, train_loader, model, opt, args, logger):
         end = time.time()
 
         if batch_idx % args.log_interval == 0:
-            if args.input_type == 'binary':
-                perc = 100. * batch_idx / len(train_loader)
+            if args.input_type == "binary":
+                perc = 100.0 * batch_idx / len(train_loader)
                 log_msg = (
-                    'Epoch {:3d} [{:5d}/{:5d} ({:2.0f}%)] | Time {:.3f} | Loss {:11.6f} | '
-                    'Rec {:11.6f} | KL {:11.6f}'.format(
+                    "Epoch {:3d} [{:5d}/{:5d} ({:2.0f}%)] | Time {:.3f} | Loss {:11.6f} | "
+                    "Rec {:11.6f} | KL {:11.6f}".format(
                         epoch, num_data, len(train_loader.sampler), perc, batch_time, loss.item(), rec, kl
                     )
                 )
             else:
-                perc = 100. * batch_idx / len(train_loader)
-                tmp = 'Epoch {:3d} [{:5d}/{:5d} ({:2.0f}%)] | Time {:.3f} | Loss {:11.6f} | Bits/dim {:8.6f}'
-                log_msg = tmp.format(epoch, num_data, len(train_loader.sampler), perc, batch_time, loss.item(),
-                                     bpd), '\trec: {:11.3f}\tkl: {:11.6f}'.format(rec, kl)
+                perc = 100.0 * batch_idx / len(train_loader)
+                tmp = "Epoch {:3d} [{:5d}/{:5d} ({:2.0f}%)] | Time {:.3f} | Loss {:11.6f} | Bits/dim {:8.6f}"
+                log_msg = tmp.format(
+                    epoch, num_data, len(train_loader.sampler), perc, batch_time, loss.item(), bpd
+                ), "\trec: {:11.3f}\tkl: {:11.6f}".format(rec, kl)
                 log_msg = "".join(log_msg)
-            if 'cnf' in args.flow:
-                log_msg += ' | NFE Forward {} | NFE Backward {}'.format(f_nfe, b_nfe)
+            if writer is not None:
+                cur_res = {"Loss-train": loss.item(), "KL-train": kl}
+                step = epoch * len(train_loader) + batch_idx
+                for key in cur_res:
+                    writer.add_scalar(key, cur_res[key], step)
+            if "cnf" in args.flow:
+                log_msg += " | NFE Forward {} | NFE Backward {}".format(f_nfe, b_nfe)
+                if writer is not None:
+                    writer.add_scalar("NFE forward", f_nfe, step)
+                    writer.add_scalar("NFE backward", b_nfe, step)
             logger.info(log_msg)
 
-    if args.input_type == 'binary':
-        logger.info('====> Epoch: {:3d} Average train loss: {:.4f}'.format(epoch, train_loss.sum() / len(train_loader)))
+    if args.input_type == "binary":
+        logger.info("====> Epoch: {:3d} Average train loss: {:.4f}".format(epoch, train_loss.sum() / len(train_loader)))
     else:
         logger.info(
-            '====> Epoch: {:3d} Average train loss: {:.4f}, average bpd: {:.4f}'.
-            format(epoch, train_loss.sum() / len(train_loader), train_bpd.sum() / len(train_loader))
+            "====> Epoch: {:3d} Average train loss: {:.4f}, average bpd: {:.4f}".format(
+                epoch, train_loss.sum() / len(train_loader), train_bpd.sum() / len(train_loader)
+            )
         )
 
     return train_loss
 
 
-def evaluate(data_loader, model, args, logger, testing=False, epoch=0):
+def evaluate(data_loader, model, args, logger, testing=False, epoch=0, writer=None):
     model.eval()
-    loss = 0.
+    loss = 0.0
+    kl = 0.0
     batch_idx = 0
-    bpd = 0.
+    bpd = 0.0
 
-    if args.input_type == 'binary':
-        loss_type = 'elbo'
+    if args.input_type == "binary":
+        loss_type = "elbo"
     else:
-        loss_type = 'bpd'
+        loss_type = "bpd"
 
-    if testing and 'cnf' in args.flow:
+    if testing and "cnf" in args.flow:
         override_divergence_fn(model, "brute_force")
 
     for data, _ in data_loader:
@@ -113,10 +124,11 @@ def evaluate(data_loader, model, args, logger, testing=False, epoch=0):
 
             x_mean, z_mu, z_var, ldj, z0, zk = model(data)
 
-            batch_loss, rec, kl, batch_bpd = calculate_loss(x_mean, data, z_mu, z_var, z0, zk, ldj, args)
+            batch_loss, rec, ckl, batch_bpd = calculate_loss(x_mean, data, z_mu, z_var, z0, zk, ldj, args)
 
             bpd += batch_bpd
             loss += batch_loss.item()
+            kl += ckl
 
             # PRINT RECONSTRUCTIONS
             if batch_idx == 1 and testing is False:
@@ -124,9 +136,14 @@ def evaluate(data_loader, model, args, logger, testing=False, epoch=0):
 
     loss /= len(data_loader)
     bpd /= len(data_loader)
+    write_key = "test" if testing else "val"
+    if writer is not None:
+        cur_res = {f"Loss-{write_key}": loss, f"KL-{write_key}": kl}
+        for key in cur_res:
+            writer.add_scalar(key, cur_res[key], epoch)
 
     if testing:
-        logger.info('====> Test set loss: {:.4f}'.format(loss))
+        logger.info("====> Test set loss: {:.4f}".format(loss))
 
     # Compute log-likelihood
     if testing and not ("cnf" in args.flow):  # don't compute log-likelihood for cnf models
@@ -137,32 +154,33 @@ def evaluate(data_loader, model, args, logger, testing=False, epoch=0):
             if args.cuda:
                 test_data = test_data.cuda()
 
-            logger.info('Computing log-likelihood on test set')
+            logger.info("Computing log-likelihood on test set")
 
             model.eval()
 
-            if args.dataset == 'caltech':
+            if args.dataset == "caltech":
                 log_likelihood, nll_bpd = calculate_likelihood(test_data, model, args, logger, S=2000, MB=500)
             else:
                 log_likelihood, nll_bpd = calculate_likelihood(test_data, model, args, logger, S=5000, MB=500)
 
-        if 'cnf' in args.flow:
+        if "cnf" in args.flow:
             override_divergence_fn(model, args.divergence_fn)
     else:
         log_likelihood = None
         nll_bpd = None
 
-    if args.input_type in ['multinomial']:
-        bpd = loss / (np.prod(args.input_size) * np.log(2.))
+    if args.input_type in ["multinomial"]:
+        bpd = loss / (np.prod(args.input_size) * np.log(2.0))
 
     if testing and not ("cnf" in args.flow):
-        logger.info('====> Test set log-likelihood: {:.4f}'.format(log_likelihood))
+        logger.info("====> Test set log-likelihood: {:.4f}".format(log_likelihood))
 
-        if args.input_type != 'binary':
-            logger.info('====> Test set bpd (elbo): {:.4f}'.format(bpd))
+        if args.input_type != "binary":
+            logger.info("====> Test set bpd (elbo): {:.4f}".format(bpd))
             logger.info(
-                '====> Test set bpd (log-likelihood): {:.4f}'.
-                format(log_likelihood / (np.prod(args.input_size) * np.log(2.)))
+                "====> Test set bpd (log-likelihood): {:.4f}".format(
+                    log_likelihood / (np.prod(args.input_size) * np.log(2.0))
+                )
             )
 
     if not testing:

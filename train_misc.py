@@ -157,7 +157,7 @@ def get_regularization(model, regularization_coeffs):
     return acc_reg_states
 
 
-def build_model_tabular(args, dims, regularization_fns=None):
+def build_model_tabular(args, dims, regularization_fns=None, odefuncclass=None):
 
     hidden_dims = tuple(map(int, args.dims.split("-")))
 
@@ -170,7 +170,11 @@ def build_model_tabular(args, dims, regularization_fns=None):
             layer_type=args.layer_type,
             nonlinearity=args.nonlinearity,
         )
-        odefunc = layers.ODEfunc(
+        if odefuncclass is None:
+            odefuncclass_ = layers.ODEfunc
+        else:
+            odefuncclass_ = odefuncclass
+        odefunc = odefuncclass_(
             diffeq=diffeq,
             divergence_fn=args.divergence_fn,
             residual=args.residual,

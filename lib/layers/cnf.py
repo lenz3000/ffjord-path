@@ -31,6 +31,41 @@ class CNF(nn.Module):
         self.test_rtol = rtol
         self.solver_options = {}
 
+    def forward_pathwise(self,z, logpz, dlogqzdz, integration_times=None, reverse=False):
+        if not self.training:
+            return self.forward(z, logpz, integration_times=integration_times, reverse=reverse)
+        
+        if integration_times is None:
+            integration_times = torch.tensor([0.0, self.sqrt_end_time * self.sqrt_end_time]).to(z)
+        if reverse:
+            integration_times = _flip(integration_times, 0)
+
+        # Refresh the odefunc statistics.
+        self.odefunc.before_odeint()
+
+        # Add regularization states.
+        reg_states = tuple(torch.tensor(0).to(z) for _ in range(self.nreg))
+        self.odefunc.pathwise = True
+        self.odefunc.used_pathwise = True
+        state_t = odeint(
+            self.odefunc,
+            (z, logpz, dlogqzdz) + reg_states,
+            integration_times.to(z),
+            atol=self.atol,
+            rtol=self.rtol,
+            method=self.solver,
+            options=self.solver_options,
+        )
+        self.odefunc.pathwise = False
+        if len(integration_times) == 2:
+            state_t = tuple(s[1] for s in state_t)
+
+        z_t, logpz_t, dlogqdz = state_t[:3]
+        self.regularization_states = state_t[3:]
+
+        return z_t, logpz_t, dlogqdz
+
+
     def forward(self, z, logpz=None, integration_times=None, reverse=False):
 
         if logpz is None:
@@ -49,6 +84,7 @@ class CNF(nn.Module):
         # Add regularization states.
         reg_states = tuple(torch.tensor(0).to(z) for _ in range(self.nreg))
 
+        self.odefunc.used_pathwise = False
         if self.training:
             state_t = odeint(
                 self.odefunc,

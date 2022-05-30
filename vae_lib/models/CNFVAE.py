@@ -5,8 +5,11 @@ import lib.layers as layers
 from .VAE import VAE
 import lib.layers.diffeq_layers as diffeq_layers
 from lib.layers.odefunc import NONLINEARITIES
+from lib.layers import odefunc
+import numpy as np
 
 from torchdiffeq import odeint_adjoint as odeint
+from vae_lib.utils.distributions import log_normal_diag
 
 
 def get_hidden_dims(args):
@@ -15,7 +18,6 @@ def get_hidden_dims(args):
 
 def concat_layer_num_params(in_dim, out_dim):
     return (in_dim + 1) * out_dim + out_dim
-
 
 class CNFVAE(VAE):
 
@@ -58,6 +60,96 @@ class CNFVAE(VAE):
 
         return x_mean, z_mu, z_var, -delta_logp.view(-1), z0, zk
 
+
+class CNFVAESTL(CNFVAE):
+    def __init__(self, args):
+        super(CNFVAE, self).__init__(args)
+
+        # CNF model
+        self.cnf = build_model_tabular(args, args.z_size, odefuncclass=STLODEfunc)
+
+        if args.cuda:
+            self.cuda()
+
+    def forward(self, x):
+        """
+        Forward pass with planar flows for the transformation z_0 -> z_1 -> ... -> z_k.
+        Log determinant is computed as log_det_j = N E_q_z0[\sum_k log |det dz_k/dz_k-1| ].
+        """
+        if not self.training:
+            return super(CNFVAESTL, self).forward(x)
+
+        z_mu, z_var = self.encode(x)
+
+        # Sample z_0
+        z0 = self.reparameterize(z_mu, z_var)
+
+        dlogqdz0 = -((z0 - z_mu)/z_var).detach()
+        logq0 = log_normal_diag(z0, mean=z_mu, log_var=z_var.log(), dim=1).detach().unsqueeze(-1)
+        zk, logq, dlogqdzk = self.cnf.forward_pathwise(z0, logpx=logq0, dlogqzdz=dlogqdz0)  # run model forward
+
+        grad_factor = (zk * dlogqdzk.detach()).sum(-1)
+        x_mean = self.decode(zk)
+        delta_logp = (logq - logq0).view(-1).detach()
+
+        return x_mean, z_mu.detach(), z_var.detach(), - delta_logp  - grad_factor + grad_factor.detach(), z0.detach(), zk
+
+class STLODEfunc(odefunc.ODEfunc):
+
+    def __init__(self, *args, pathwise=False, **kwargs):
+        self.pathwise = pathwise
+        self.used_pathwise = False
+        super(STLODEfunc, self).__init__(*args, **kwargs)
+
+    def forward(self, t, states):
+        assert len(states) >= 2
+        if self.pathwise:
+            assert len(states) >= 3, 'For the pathwise odefunc we need at least y, delta_logp, vjp_y'
+            assert not self.residual, "I haven't looked at residuals yet!!"
+        y = states[0]
+
+        # increment num evals
+        self._num_evals += 1
+
+        # convert to tensor
+        t = torch.tensor(t).type_as(y)
+        batchsize = y.shape[0]
+
+        # Sample and fix the noise.
+        if self._e is None:
+            if self.rademacher:
+                self._e = odefunc.sample_rademacher_like(y)
+            else:
+                self._e = odefunc.sample_gaussian_like(y)
+
+        with torch.set_grad_enabled(True):
+            y.requires_grad_(True)
+            t.requires_grad_(True)
+            for s_ in states[2:]:
+                s_.requires_grad_(True)
+
+            # I just skip the extra state that was used for dlogqdzT
+            # This is the case for the backward call
+            dy = self.diffeq(t, y, *states[(2 + self.used_pathwise):])
+            # Hack for 2D data to use brute force divergence computation.
+            if not self.training and dy.view(dy.shape[0], -1).shape[1] == 2:
+                divergence = odefunc.divergence_bf(dy, y).view(batchsize, 1)
+            else:
+                divergence = self.divergence_fn(dy, y, e=self._e).view(batchsize, 1)
+            # The not pathwise case
+            if not self.pathwise:
+                if self.residual:
+                    dy = dy - y
+                    divergence -= torch.ones_like(divergence) * torch.tensor(np.prod(y.shape[1:]), dtype=torch.float32
+                                                                             ).to(divergence)
+                return tuple([dy, -divergence] + [torch.zeros_like(s_).requires_grad_(True) for s_ in states[2:]])
+
+            # Now we have the pathwise gradient estimator
+            adj_y = states[2]
+            vjp_y = torch.autograd.grad( (dy * ( - adj_y.detach())).sum() - divergence.sum(),
+                    y,allow_unused=True)[0]
+
+            return tuple([dy, -divergence, vjp_y.detach()] + [torch.zeros_like(s_).requires_grad_(True) for s_ in states[3:]])
 
 class AmortizedBiasODEnet(nn.Module):
 
@@ -389,6 +481,92 @@ class AmortizedLowRankCNFVAE(AmortizedCNFVAE):
         in_dims = (out_dims[-1],) + out_dims[:-1]
         params_size = (sum(in_dims) + sum(out_dims)) * args.rank + sum(out_dims)
         return nn.ModuleList([nn.Linear(self.h_size, params_size) for _ in range(args.num_blocks)])
+
+class LowRankCNFVAESTL(AmortizedCNFVAE):
+    h_size = 256
+
+    def __init__(self, args):
+        super(AmortizedCNFVAE, self).__init__(args)
+
+        # CNF model
+        self.odefuncs = nn.ModuleList([
+            self.construct_amortized_stl_odefunc(args, args.z_size) for _ in range(args.num_blocks)
+        ])
+        self.q_am = self._amortized_layers(args)
+        assert len(self.q_am) == args.num_blocks or len(self.q_am) == 0
+
+
+        if args.cuda:
+            self.cuda()
+
+        self.register_buffer('integration_times', torch.tensor([0.0, args.time_length]))
+
+        self.atol = args.atol
+        self.rtol = args.rtol
+        self.solver = args.solver
+
+    @staticmethod
+    def construct_amortized_stl_odefunc(args, z_dim):
+
+        hidden_dims = get_hidden_dims(args)
+
+        diffeq = AmortizedLowRankODEnet(
+                hidden_dims=hidden_dims,
+                input_dim=z_dim,
+                layer_type=args.layer_type,
+                nonlinearity=args.nonlinearity,
+                rank=args.rank,
+            )
+        odefunc = STLODEfunc(
+            diffeq=diffeq,
+            divergence_fn=args.divergence_fn,
+            residual=args.residual,
+            rademacher=args.rademacher,
+        )
+        return odefunc
+
+    def _amortized_layers(self, args):
+        out_dims = get_hidden_dims(args)
+        in_dims = (out_dims[-1],) + out_dims[:-1]
+        params_size = (sum(in_dims) + sum(out_dims)) * args.rank + sum(out_dims)
+        return nn.ModuleList([nn.Linear(self.h_size, params_size) for _ in range(args.num_blocks)])
+
+    def forward(self, x):
+
+        self.log_det_j = 0.
+
+        z_mu, z_var, am_params = self.encode(x)
+
+        # Sample z_0
+        z0 = self.reparameterize(z_mu, z_var)
+
+        dlogqdz = -((z0 - z_mu)/z_var).detach()
+        logq0 = log_normal_diag(z0, mean=z_mu, log_var=z_var.log(), dim=1).detach().unsqueeze(-1)
+
+        logq = logq0
+        z = z0
+        for odefunc, am_param in zip(self.odefuncs, am_params):
+            am_param_unpacked = odefunc.diffeq._unpack_params(am_param)
+            odefunc.before_odeint()
+            odefunc.pathwise = True
+            odefunc.used_pathwise = True
+            states = odeint(
+                odefunc,
+                (z, logq, dlogqdz) + tuple(am_param_unpacked),
+                self.integration_times.to(z),
+                atol=self.atol,
+                rtol=self.rtol,
+                method=self.solver,
+            )
+            odefunc.pathwise = False
+            z, logq, dlogqdz = states[0][-1], states[1][-1], states[2][-1]
+
+        grad_factor = (z * dlogqdz.detach()).sum(-1)
+        x_mean = self.decode(z)
+        delta_logp = (logq - logq0).view(-1).detach()
+
+        return x_mean, z_mu.detach(), z_var.detach(), - delta_logp  - grad_factor + grad_factor.detach(), z0.detach(), z
+        #return x_mean, z_mu, z_var, -delta_logp.view(-1), z0, z
 
 
 class HypernetCNFVAE(AmortizedCNFVAE):

@@ -22,9 +22,11 @@ python train_vae_flow.py --dataset mnist --flow=cnf_rank_stl --epochs=5000 --dim
 
 ## Bibtex:
 If you use this code please cite:
+```
 @article{vaitl2022path,
   title={Path-Gradient Estimators for Continuous Normalizing Flows},
   author={Vaitl, Lorenz and Nicoli, Kim A. and Nakajima, Shinichi and Kessel, Pan},
   journal={International Conference on Machine Learning},
   year={2022}
 }
+```
